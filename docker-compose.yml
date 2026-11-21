@@ -1,0 +1,158 @@
+# Start everything:  cp .env.example .env && docker compose up --build
+# Startup order: postgres+redis healthy -> migrate (one-shot) -> backend, worker, cleanup -> frontend.
+
+x-backend-env: &backend-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_JSON: ${LOG_JSON:-true}
+  BASE_URL: ${BASE_URL:-http://localhost:8000}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+  HSTS_ENABLED: ${HSTS_ENABLED:-false}
+  TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+  REDIS_URL: redis://redis:6379/0
+  CACHE_REDIS_URL: ${CACHE_REDIS_URL:-}
+  RATELIMIT_REDIS_URL: ${RATELIMIT_REDIS_URL:-}
+  STREAM_REDIS_URL: ${STREAM_REDIS_URL:-}
+  REDIS_SOCKET_TIMEOUT_MS: ${REDIS_SOCKET_TIMEOUT_MS:-250}
+  SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+  IP_HASH_SECRET: ${IP_HASH_SECRET:?set IP_HASH_SECRET in .env}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+  ANONYMOUS_CREATION_ENABLED: ${ANONYMOUS_CREATION_ENABLED:-true}
+  ID_RANGE_SIZE: ${ID_RANGE_SIZE:-1000}
+  ID_SCRAMBLE_MULTIPLIER: ${ID_SCRAMBLE_MULTIPLIER:-2654435761}
+  ID_SCRAMBLE_OFFSET: ${ID_SCRAMBLE_OFFSET:-987654321}
+  CACHE_ENABLED: ${CACHE_ENABLED:-true}
+  NEGATIVE_CACHE_ENABLED: ${NEGATIVE_CACHE_ENABLED:-true}
+  CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-86400}
+  NEGATIVE_CACHE_TTL_SECONDS: ${NEGATIVE_CACHE_TTL_SECONDS:-60}
+  RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+  RATE_LIMIT_FAIL_OPEN: ${RATE_LIMIT_FAIL_OPEN:-true}
+  RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+  RATE_LIMIT_CREATE_PER_WINDOW: ${RATE_LIMIT_CREATE_PER_WINDOW:-10}
+  RATE_LIMIT_CREATE_USER_PER_WINDOW: ${RATE_LIMIT_CREATE_USER_PER_WINDOW:-60}
+  RATE_LIMIT_REDIRECT_PER_WINDOW: ${RATE_LIMIT_REDIRECT_PER_WINDOW:-120}
+  RATE_LIMIT_AUTH_PER_WINDOW: ${RATE_LIMIT_AUTH_PER_WINDOW:-10}
+  ANALYTICS_ENABLED: ${ANALYTICS_ENABLED:-true}
+  STREAM_ENQUEUE_TIMEOUT_MS: ${STREAM_ENQUEUE_TIMEOUT_MS:-50}
+  GEOIP_DB_PATH: ${GEOIP_DB_PATH:-}
+  STORE_EVENT_DETAILS: ${STORE_EVENT_DETAILS:-false}
+  CLICK_EVENT_RETENTION_DAYS: ${CLICK_EVENT_RETENTION_DAYS:-7}
+  WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-500}
+  WORKER_FLUSH_INTERVAL_SECONDS: ${WORKER_FLUSH_INTERVAL_SECONDS:-5}
+  WORKER_CLAIM_IDLE_MS: ${WORKER_CLAIM_IDLE_MS:-60000}
+  WORKER_CLAIM_INTERVAL_SECONDS: ${WORKER_CLAIM_INTERVAL_SECONDS:-15}
+  WORKER_METRICS_PORT: ${WORKER_METRICS_PORT:-9101}
+  CLEANUP_INTERVAL_SECONDS: ${CLEANUP_INTERVAL_SECONDS:-60}
+  CLEANUP_BATCH_SIZE: ${CLEANUP_BATCH_SIZE:-1000}
+  EXPIRED_URL_PURGE_DAYS: ${EXPIRED_URL_PURGE_DAYS:-0}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF with per-second fsync: at most ~1s of cache/stream data lost on a crash. The click stream is
+    # the only data here that matters; it is retained until the worker acknowledges it.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "900 1", "--save", "300 100"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 15s
+
+  migrate:
+    build: ./backend
+    image: url-shortener-backend
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build: ./backend
+    image: url-shortener-backend
+    restart: unless-stopped
+    environment: *backend-env
+    ports:
+      - "${BACKEND_HOST_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    stop_grace_period: 30s
+
+  worker:
+    build: ./backend
+    image: url-shortener-backend
+    command: ["python", "-m", "app.workers.click_worker"]
+    restart: unless-stopped
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s   # lets the worker flush its buffer on SIGTERM
+
+  cleanup:
+    build: ./backend
+    image: url-shortener-backend
+    command: ["python", "-m", "app.workers.cleanup_worker"]
+    restart: unless-stopped
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    stop_grace_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_HOST_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
